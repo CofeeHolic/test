@@ -49,7 +49,11 @@ ADX_THRESHOLD = 25
 
 # Trade parameters
 TAKE_PROFIT_PCT = 1.0
-TRAILING_STOP_PCT = 0.6
+TRAILING_STOP_PCT = 0.6 # Used for initial stop and breakeven trigger
+
+# Volume parameters
+VOLUME_MA_PERIOD = 20
+VOLUME_FACTOR = 1.5
 
 # --- 2. Data Fetching ---
 def fetch_data(ticker, start, end, interval):
@@ -78,6 +82,9 @@ def calculate_indicators(data):
     adx_indicator = ta.trend.ADXIndicator(high_series, low_series, close_series, window=ADX_PERIOD)
     data['adx'] = adx_indicator.adx()
 
+    # Calculate Volume MA
+    data['volume_ma'] = data['Volume'].rolling(window=VOLUME_MA_PERIOD).mean()
+
     data.dropna(inplace=True)
     return data
 
@@ -94,13 +101,15 @@ def run_backtest(data, initial_capital, risk_pct):
     rsi_was_overbought = False
 
     for i in range(1, len(data)):
-        # yfinance can return a multi-index, so we use .item() to get the scalar
-        # value from the 'Close' column to avoid FutureWarnings.
-        # Calculated columns ('rsi', 'adx') are simple Series, so .iloc is fine.
+        # Get all required values for the current 5-minute candle, ensuring they are scalar
         current_price = data['Close'].iloc[i].item()
-        current_rsi = data['rsi'].iloc[i]
-        prev_rsi = data['rsi'].iloc[i-1]
-        adx = data['adx'].iloc[i]
+        current_rsi = data['rsi'].iloc[i].item()
+        prev_rsi = data['rsi'].iloc[i-1].item()
+        adx = data['adx'].iloc[i].item()
+        volume = data['Volume'].iloc[i].item()
+        volume_ma = data['volume_ma'].iloc[i].item()
+        close_1h = data['close_1h'].iloc[i].item()
+        ema_50_1h = data['ema_50_1h'].iloc[i].item()
 
         # Update RSI state flags
         if prev_rsi < RSI_OVERSOLD:
@@ -119,29 +128,30 @@ def run_backtest(data, initial_capital, risk_pct):
             pnl = 0
             exit_reason = None
 
-            # Trailing Stop Loss Update
-            if position == 'LONG':
-                # Update trailing stop
-                new_trailing_stop = current_price * (1 - TRAILING_STOP_PCT / 100)
-                trailing_stop_loss = max(trailing_stop_loss, new_trailing_stop)
+            # Move to Breakeven Logic
+            if not stop_moved_to_be:
+                if position == 'LONG' and current_price >= entry_price * (1 + TRAILING_STOP_PCT / 100):
+                    stop_loss = entry_price
+                    stop_moved_to_be = True
+                    # print(f"Stop moved to breakeven for LONG trade at {data.index[i]}")
+                elif position == 'SHORT' and current_price <= entry_price * (1 - TRAILING_STOP_PCT / 100):
+                    stop_loss = entry_price
+                    stop_moved_to_be = True
+                    # print(f"Stop moved to breakeven for SHORT trade at {data.index[i]}")
 
-                # Check for exit
-                if current_price <= trailing_stop_loss:
-                    pnl = (trailing_stop_loss - entry_price) * quantity
-                    exit_reason = "Trailing Stop"
+            # Check for Stop Loss or Take Profit
+            if position == 'LONG':
+                if current_price <= stop_loss:
+                    pnl = (stop_loss - entry_price) * quantity
+                    exit_reason = "Stop Loss"
                 elif current_price >= take_profit:
                     pnl = (take_profit - entry_price) * quantity
                     exit_reason = "Take Profit"
 
             elif position == 'SHORT':
-                # Update trailing stop
-                new_trailing_stop = current_price * (1 + TRAILING_STOP_PCT / 100)
-                trailing_stop_loss = min(trailing_stop_loss, new_trailing_stop)
-
-                # Check for exit
-                if current_price >= trailing_stop_loss:
-                    pnl = (entry_price - trailing_stop_loss) * quantity
-                    exit_reason = "Trailing Stop"
+                if current_price >= stop_loss:
+                    pnl = (entry_price - stop_loss) * quantity
+                    exit_reason = "Stop Loss"
                 elif current_price <= take_profit:
                     pnl = (entry_price - take_profit) * quantity
                     exit_reason = "Take Profit"
@@ -164,41 +174,59 @@ def run_backtest(data, initial_capital, risk_pct):
 
         # --- Entry Logic ---
         if not position:
+            # --- CONFLUENCE ENTRY LOGIC ---
+
+            # 1. Trend Filter (HTF)
+            is_uptrend = close_1h > ema_50_1h
+            is_downtrend = close_1h < ema_50_1h
+
+            # 2. Momentum Filter (LTF)
+            has_momentum = adx > ADX_THRESHOLD
+
+            # 3. RSI Signal (LTF)
+            long_rsi_signal = rsi_was_oversold and prev_rsi < RSI_LONG_ENTRY and current_rsi >= RSI_LONG_ENTRY
+            short_rsi_signal = rsi_was_overbought and prev_rsi > RSI_SHORT_ENTRY and current_rsi <= RSI_SHORT_ENTRY
+
+            # 4. Volume Confirmation (LTF)
+            has_volume = volume > volume_ma * VOLUME_FACTOR
+
             # Long Entry
-            if rsi_was_oversold and prev_rsi < RSI_LONG_ENTRY and current_rsi >= RSI_LONG_ENTRY and adx > ADX_THRESHOLD:
+            if is_uptrend and has_momentum and long_rsi_signal and has_volume:
                 position = 'LONG'
                 entry_price = current_price
                 entry_time = data.index[i]
 
                 take_profit = entry_price * (1 + TAKE_PROFIT_PCT / 100)
-                trailing_stop_loss = entry_price * (1 - TRAILING_STOP_PCT / 100)
+                stop_loss = entry_price * (1 - TRAILING_STOP_PCT / 100) # This is now a fixed stop
 
-                risk_per_share = entry_price - trailing_stop_loss
+                risk_per_share = entry_price - stop_loss
                 risk_amount = (capital * risk_pct) / 100
                 quantity = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
 
                 if quantity > 0:
                     print(f"\nNew LONG trade initiated at {entry_time}")
+                    stop_moved_to_be = False # Reset breakeven flag
                 else:
-                    position = None # Invalidate trade if quantity is 0
+                    position = None
 
             # Short Entry
-            elif rsi_was_overbought and prev_rsi > RSI_SHORT_ENTRY and current_rsi <= RSI_SHORT_ENTRY and adx > ADX_THRESHOLD:
+            elif is_downtrend and has_momentum and short_rsi_signal and has_volume:
                 position = 'SHORT'
                 entry_price = current_price
                 entry_time = data.index[i]
 
                 take_profit = entry_price * (1 - TAKE_PROFIT_PCT / 100)
-                trailing_stop_loss = entry_price * (1 + TRAILING_STOP_PCT / 100)
+                stop_loss = entry_price * (1 + TRAILING_STOP_PCT / 100) # This is now a fixed stop
 
-                risk_per_share = trailing_stop_loss - entry_price
+                risk_per_share = stop_loss - entry_price
                 risk_amount = (capital * risk_pct) / 100
                 quantity = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
 
                 if quantity > 0:
                     print(f"\nNew SHORT trade initiated at {entry_time}")
+                    stop_moved_to_be = False # Reset breakeven flag
                 else:
-                    position = None # Invalidate trade if quantity is 0
+                    position = None
 
         equity_curve.append(capital)
 
@@ -253,21 +281,38 @@ if __name__ == "__main__":
     for ticker in TICKER_LIST:
         print(f"--- Running backtest for {ticker} ---")
         try:
-            # 1. Fetch Data
-            stock_data = fetch_data(ticker, START_DATE, END_DATE, INTERVAL)
+            # 1. Fetch Data for multiple timeframes
+            data_5m = fetch_data(ticker, START_DATE, END_DATE, interval="5m")
+            data_1h = fetch_data(ticker, START_DATE, END_DATE, interval="1h")
 
-            if stock_data is not None and not stock_data.empty:
-                # 2. Calculate Indicators
-                stock_data = calculate_indicators(stock_data)
+            if data_5m is None or data_5m.empty or data_1h is None or data_1h.empty:
+                print(f"Could not fetch sufficient data for {ticker}. Skipping.")
+                continue
 
-                # 3. Run Backtest
-                trade_log, equity_curve = run_backtest(stock_data, INITIAL_CAPITAL, RISK_PER_TRADE_PCT)
+            # 2. Prepare HTF (Higher Timeframe) indicators and merge
+            ema_close_1h = pd.Series(data_1h['Close'].values.flatten(), index=data_1h.index)
+            data_1h['ema_50_1h'] = ta.trend.EMAIndicator(ema_close_1h, window=50).ema_indicator()
+            htf_data = data_1h[['ema_50_1h', 'Close']].rename(columns={'Close': 'close_1h'})
 
-                # 4. Analyze Performance
-                metrics = analyze_performance(trade_log, equity_curve, INITIAL_CAPITAL)
-                metrics['Ticker'] = ticker
-                all_results.append(metrics)
-                print(f"Backtest for {ticker} complete. PnL: {metrics['Total PnL']}")
+            # Forward-fill the 1-hour data onto the 5-minute timeline
+            merged_data = pd.merge_asof(data_5m.sort_index(), htf_data.sort_index(), left_index=True, right_index=True, direction='backward')
+            merged_data.dropna(inplace=True)
+
+            if merged_data.empty:
+                print(f"Data for {ticker} could not be merged. Skipping.")
+                continue
+
+            # 3. Calculate LTF (Lower Timeframe) indicators
+            stock_data = calculate_indicators(merged_data)
+
+            # 4. Run Backtest
+            trade_log, equity_curve = run_backtest(stock_data, INITIAL_CAPITAL, RISK_PER_TRADE_PCT)
+
+            # 5. Analyze Performance
+            metrics = analyze_performance(trade_log, equity_curve, INITIAL_CAPITAL)
+            metrics['Ticker'] = ticker
+            all_results.append(metrics)
+            print(f"Backtest for {ticker} complete. PnL: {metrics['Total PnL']}")
 
         except Exception as e:
             print(f"An error occurred for ticker {ticker}: {e}")
