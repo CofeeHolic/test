@@ -5,20 +5,22 @@ This script fetches historical price data from the Shoonya API by Finvasia.
 
 # Import necessary libraries
 import pandas as pd
+import pyotp
 from api_helper import ShoonyaApiPy
 from datetime import datetime, timedelta
 
 # --- Step 1: Add your credentials here ---
 # Replace the placeholder values with your actual Shoonya API credentials.
-user = "YOUR_USER_ID"  # Your user ID
-pwd = "YOUR_PASSWORD"  # Your password
-factor2 = "YOUR_TOTP"  # Your two-factor authentication (TOTP)
-vc = "YOUR_VENDOR_CODE"  # Your vendor code
-api_key = "YOUR_API_KEY"  # Your API key
-imei = "YOUR_IMEI"  # Your IMEI or a unique identifier
+user = "YOUR_USER_ID"          # Your user ID
+pwd = "YOUR_PASSWORD"        # Your password
+totp_secret = "YOUR_TOTP_SECRET"  # Your TOTP secret key for 2FA
+vc = "YOUR_VENDOR_CODE"      # Your vendor code
+api_key = "YOUR_API_KEY"       # Your API key
+imei = "YOUR_IMEI"           # Your IMEI or a unique identifier
 
-# --- Step 2: Initialize the API ---
+# --- Step 2: Initialize the API and Generate TOTP ---
 api = ShoonyaApiPy()
+factor2 = pyotp.TOTP(totp_secret).now() # Generate the current TOTP
 
 # --- Step 3: Login to the API ---
 try:
