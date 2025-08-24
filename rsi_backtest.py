@@ -29,6 +29,12 @@ except ImportError:
     install('matplotlib')
     import matplotlib.pyplot as plt
 
+try:
+    from scipy.signal import find_peaks
+except ImportError:
+    install('scipy')
+    from scipy.signal import find_peaks
+
 # --- 1. Parameters ---
 START_DATE = "2025-07-01"
 END_DATE = "2025-08-20"
@@ -48,45 +54,99 @@ ADX_PERIOD = 14
 ADX_THRESHOLD = 25
 
 # Trade parameters
-TAKE_PROFIT_PCT = 1.0
 TRAILING_STOP_PCT = 0.6 # Used for initial stop and breakeven trigger
 
 # Volume parameters
 VOLUME_MA_PERIOD = 20
 VOLUME_FACTOR = 1.5
 
+# Bollinger Band parameters
+BB_PERIOD = 20
+BB_STD_DEV = 2
+BBW_SQUEEZE_THRESHOLD = 0.015 # Bollinger Band Width squeeze threshold
+
+# Divergence Parameters
+DIVERGENCE_LOOKBACK = 30 # Lookback period for finding divergence
+DIVERGENCE_PEAK_DISTANCE = 5 # Min distance between peaks/troughs for divergence
+
 # --- 2. Data Fetching ---
 def fetch_data(ticker, start, end, interval):
-    """Fetches historical data from yfinance."""
+    """Fetches historical data from yfinance and standardizes column names."""
     print(f"Fetching data for {ticker} from {start} to {end} with {interval} interval...")
     data = yfinance.download(ticker, start=start, end=end, interval=interval)
     if data.empty:
         print(f"No data found for {ticker}. Please check the ticker and date range.")
         return None
+
+    # Flatten MultiIndex columns if they exist (e.g., ('Close', 'RELIANCE.NS'))
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
+    # Standardize column names to lowercase
+    data.columns = [str(col).lower() for col in data.columns]
+
     data.dropna(inplace=True)
     print("Data fetched successfully.")
     return data
 
 # --- 3. Indicator Calculation ---
 def calculate_indicators(data):
-    """Calculates RSI and other indicators."""
-    # Force data into 1D pandas Series to fix issues with some yfinance/pandas versions
-    close_series = pd.Series(data['Close'].values.flatten(), index=data.index)
-    high_series = pd.Series(data['High'].values.flatten(), index=data.index)
-    low_series = pd.Series(data['Low'].values.flatten(), index=data.index)
+    """Calculates all required indicators and joins them to the main dataframe."""
 
-    # Calculate RSI
-    data['rsi'] = ta.momentum.RSIIndicator(close_series, window=RSI_PERIOD).rsi()
+    # Create a new DataFrame for the indicators to avoid index issues
+    indicators = pd.DataFrame(index=data.index)
 
-    # Calculate ADX
-    adx_indicator = ta.trend.ADXIndicator(high_series, low_series, close_series, window=ADX_PERIOD)
-    data['adx'] = adx_indicator.adx()
+    # Ensure source columns are 1D Series before passing to indicators
+    close = data['close'].squeeze()
+    high = data['high'].squeeze()
+    low = data['low'].squeeze()
+    volume = data['volume'].squeeze()
 
-    # Calculate Volume MA
-    data['volume_ma'] = data['Volume'].rolling(window=VOLUME_MA_PERIOD).mean()
+    # Calculate indicators
+    indicators['rsi'] = ta.momentum.RSIIndicator(close, window=RSI_PERIOD).rsi()
+    indicators['adx'] = ta.trend.ADXIndicator(high, low, close, window=ADX_PERIOD).adx()
+    indicators['volume_ma'] = volume.rolling(window=VOLUME_MA_PERIOD).mean()
+    indicators['bbw'] = ta.volatility.BollingerBands(close, window=BB_PERIOD, window_dev=BB_STD_DEV).bollinger_wband()
+
+    # Join the new indicators back to the original data
+    data = data.join(indicators)
 
     data.dropna(inplace=True)
     return data
+
+def find_divergence(prices, indicator, lookback, peak_distance):
+    """
+    Finds bullish or bearish divergence between price and an indicator.
+    Returns: 'BULLISH', 'BEARISH', or None
+    """
+    # Find peaks (highs) and troughs (lows)
+    # For troughs, we find peaks in the negative series
+    price_highs, _ = find_peaks(prices, distance=peak_distance)
+    price_lows, _ = find_peaks(-prices, distance=peak_distance)
+    indicator_highs, _ = find_peaks(indicator, distance=peak_distance)
+    indicator_lows, _ = find_peaks(-indicator, distance=peak_distance)
+
+    # Check for Bearish Divergence (Higher High in Price, Lower High in Indicator)
+    if len(price_highs) >= 2 and len(indicator_highs) >= 2:
+        last_price_high = prices[price_highs[-1]]
+        prev_price_high = prices[price_highs[-2]]
+        last_indicator_high = indicator[indicator_highs[-1]]
+        prev_indicator_high = indicator[indicator_highs[-2]]
+
+        if last_price_high > prev_price_high and last_indicator_high < prev_indicator_high:
+            return 'BEARISH'
+
+    # Check for Bullish Divergence (Lower Low in Price, Higher Low in Indicator)
+    if len(price_lows) >= 2 and len(indicator_lows) >= 2:
+        last_price_low = prices[price_lows[-1]]
+        prev_price_low = prices[price_lows[-2]]
+        last_indicator_low = indicator[indicator_lows[-1]]
+        prev_indicator_low = indicator[indicator_lows[-2]]
+
+        if last_price_low < prev_price_low and last_indicator_low > prev_indicator_low:
+            return 'BULLISH'
+
+    return None
 
 # --- 4. Backtesting Engine ---
 def run_backtest(data, initial_capital, risk_pct):
@@ -100,16 +160,27 @@ def run_backtest(data, initial_capital, risk_pct):
     rsi_was_oversold = False
     rsi_was_overbought = False
 
-    for i in range(1, len(data)):
+    # State management for divergence
+    divergence_signal = None
+
+    for i in range(DIVERGENCE_LOOKBACK, len(data)):
         # Get all required values for the current 5-minute candle, ensuring they are scalar
-        current_price = data['Close'].iloc[i].item()
+        current_price = data['close'].iloc[i].item()
         current_rsi = data['rsi'].iloc[i].item()
         prev_rsi = data['rsi'].iloc[i-1].item()
         adx = data['adx'].iloc[i].item()
-        volume = data['Volume'].iloc[i].item()
+        volume = data['volume'].iloc[i].item()
         volume_ma = data['volume_ma'].iloc[i].item()
         close_1h = data['close_1h'].iloc[i].item()
         ema_50_1h = data['ema_50_1h'].iloc[i].item()
+        bbw = data['bbw'].iloc[i].item()
+
+        # --- Divergence Detection ---
+        # We only check for divergence if we are not in a position
+        if not position:
+            price_slice = data['close'].iloc[i-DIVERGENCE_LOOKBACK:i+1].values.flatten()
+            rsi_slice = data['rsi'].iloc[i-DIVERGENCE_LOOKBACK:i+1].values.flatten()
+            divergence_signal = find_divergence(price_slice, rsi_slice, DIVERGENCE_LOOKBACK, DIVERGENCE_PEAK_DISTANCE)
 
         # Update RSI state flags
         if prev_rsi < RSI_OVERSOLD:
@@ -123,38 +194,42 @@ def run_backtest(data, initial_capital, risk_pct):
         if prev_rsi > 50 and current_rsi <= 50:
             rsi_was_overbought = False
 
-        # --- Position Management ---
+        # --- Position Management (Trend Rider Exit Logic) ---
         if position:
             pnl = 0
             exit_reason = None
 
-            # Move to Breakeven Logic
-            if not stop_moved_to_be:
-                if position == 'LONG' and current_price >= entry_price * (1 + TRAILING_STOP_PCT / 100):
-                    stop_loss = entry_price
-                    stop_moved_to_be = True
-                    # print(f"Stop moved to breakeven for LONG trade at {data.index[i]}")
-                elif position == 'SHORT' and current_price <= entry_price * (1 - TRAILING_STOP_PCT / 100):
-                    stop_loss = entry_price
-                    stop_moved_to_be = True
-                    # print(f"Stop moved to breakeven for SHORT trade at {data.index[i]}")
-
-            # Check for Stop Loss or Take Profit
             if position == 'LONG':
+                # Stage 3: Trailing stop after breakeven
+                if stop_moved_to_be:
+                    peak_price = max(peak_price, current_price)
+                    stop_loss = peak_price * (1 - 1.5 / 100) # 1.5% trail from peak
+                # Stage 2: Move to breakeven
+                elif not stop_moved_to_be and current_price >= entry_price * (1 + TRAILING_STOP_PCT / 100):
+                    stop_loss = entry_price
+                    stop_moved_to_be = True
+
+                # Check for exit (Stage 1 initial stop is the default)
                 if current_price <= stop_loss:
                     pnl = (stop_loss - entry_price) * quantity
                     exit_reason = "Stop Loss"
-                elif current_price >= take_profit:
-                    pnl = (take_profit - entry_price) * quantity
-                    exit_reason = "Take Profit"
 
             elif position == 'SHORT':
+                # Stage 3: Trailing stop after breakeven
+                if stop_moved_to_be:
+                    peak_price = min(peak_price, current_price)
+                    stop_loss = peak_price * (1 + 1.5 / 100) # 1.5% trail from peak
+                # Stage 2: Move to breakeven
+                elif not stop_moved_to_be and current_price <= entry_price * (1 - TRAILING_STOP_PCT / 100):
+                    stop_loss = entry_price
+                    stop_moved_to_be = True
+
+                # Check for exit (Stage 1 initial stop is the default)
                 if current_price >= stop_loss:
                     pnl = (entry_price - stop_loss) * quantity
                     exit_reason = "Stop Loss"
-                elif current_price <= take_profit:
-                    pnl = (entry_price - take_profit) * quantity
-                    exit_reason = "Take Profit"
+
+            # NOTE: Fixed Take Profit has been removed for the Trend Rider logic
 
             if exit_reason:
                 capital += pnl
@@ -174,30 +249,35 @@ def run_backtest(data, initial_capital, risk_pct):
 
         # --- Entry Logic ---
         if not position:
-            # --- CONFLUENCE ENTRY LOGIC ---
+            # --- DIVERGENCE CONFIRMATION ENTRY LOGIC (6 STEPS) ---
 
-            # 1. Trend Filter (HTF)
+            # 1. Volatility Filter
+            is_volatile = bbw > BBW_SQUEEZE_THRESHOLD
+
+            # 2. Trend Filter
             is_uptrend = close_1h > ema_50_1h
             is_downtrend = close_1h < ema_50_1h
 
-            # 2. Momentum Filter (LTF)
+            # 3. Momentum Filter
             has_momentum = adx > ADX_THRESHOLD
 
-            # 3. RSI Signal (LTF)
-            long_rsi_signal = rsi_was_oversold and prev_rsi < RSI_LONG_ENTRY and current_rsi >= RSI_LONG_ENTRY
-            short_rsi_signal = rsi_was_overbought and prev_rsi > RSI_SHORT_ENTRY and current_rsi <= RSI_SHORT_ENTRY
+            # 4. RSI Divergence Signal (already detected and stored in divergence_signal)
 
-            # 4. Volume Confirmation (LTF)
+            # 5. RSI Entry Trigger
+            long_rsi_trigger = rsi_was_oversold and prev_rsi < RSI_LONG_ENTRY and current_rsi >= RSI_LONG_ENTRY
+            short_rsi_trigger = rsi_was_overbought and prev_rsi > RSI_SHORT_ENTRY and current_rsi <= RSI_SHORT_ENTRY
+
+            # 6. Volume Confirmation
             has_volume = volume > volume_ma * VOLUME_FACTOR
 
             # Long Entry
-            if is_uptrend and has_momentum and long_rsi_signal and has_volume:
+            if (is_volatile and is_uptrend and has_momentum and
+                divergence_signal == 'BULLISH' and long_rsi_trigger and has_volume):
                 position = 'LONG'
                 entry_price = current_price
                 entry_time = data.index[i]
 
-                take_profit = entry_price * (1 + TAKE_PROFIT_PCT / 100)
-                stop_loss = entry_price * (1 - TRAILING_STOP_PCT / 100) # This is now a fixed stop
+                stop_loss = entry_price * (1 - TRAILING_STOP_PCT / 100)
 
                 risk_per_share = entry_price - stop_loss
                 risk_amount = (capital * risk_pct) / 100
@@ -205,18 +285,19 @@ def run_backtest(data, initial_capital, risk_pct):
 
                 if quantity > 0:
                     print(f"\nNew LONG trade initiated at {entry_time}")
-                    stop_moved_to_be = False # Reset breakeven flag
+                    stop_moved_to_be = False
+                    peak_price = entry_price
                 else:
                     position = None
 
             # Short Entry
-            elif is_downtrend and has_momentum and short_rsi_signal and has_volume:
+            elif (is_volatile and is_downtrend and has_momentum and
+                  divergence_signal == 'BEARISH' and short_rsi_trigger and has_volume):
                 position = 'SHORT'
                 entry_price = current_price
                 entry_time = data.index[i]
 
-                take_profit = entry_price * (1 - TAKE_PROFIT_PCT / 100)
-                stop_loss = entry_price * (1 + TRAILING_STOP_PCT / 100) # This is now a fixed stop
+                stop_loss = entry_price * (1 + TRAILING_STOP_PCT / 100)
 
                 risk_per_share = stop_loss - entry_price
                 risk_amount = (capital * risk_pct) / 100
@@ -224,13 +305,14 @@ def run_backtest(data, initial_capital, risk_pct):
 
                 if quantity > 0:
                     print(f"\nNew SHORT trade initiated at {entry_time}")
-                    stop_moved_to_be = False # Reset breakeven flag
+                    stop_moved_to_be = False
+                    peak_price = entry_price
                 else:
                     position = None
 
         equity_curve.append(capital)
 
-    return pd.DataFrame(trade_log), pd.Series(equity_curve, index=data.index)
+    return pd.DataFrame(trade_log), pd.Series(equity_curve, index=data.index[DIVERGENCE_LOOKBACK-1:])
 
 
 # --- 5. Performance Analysis ---
@@ -273,7 +355,12 @@ if __name__ == "__main__":
         "NFL.NS", "EMBDL.NS", "SPARC.NS", "BAJAJHFL.NS", "BANKINDIA.NS",
         "LEMONTREE.NS", "STLTECH.NS", "JAIBALAJI.NS", "NTPCGREEN.NS", "NIVABUPA.NS",
         "INOXWIND.NS", "BEPL.NS", "ELECTCAST.NS", "SJVN.NS", "TVSSCS.NS",
-        "CANBK.NS", "SBFC.NS", "IRFC.NS", "JAICORPLTD.NS", "SAMMAANCAP.NS"
+        "CANBK.NS", "SBFC.NS", "IRFC.NS", "JAICORPLTD.NS", "SAMMAANCAP.NS",
+        "NHPC.NS", "IOC.NS", "ASHOKLEY.NS", "MRPL.NS", "REDTAPE.NS",
+        "WELSPUNLIV.NS", "IREDA.NS", "NBCC.NS", "UNIONBANK.NS", "IEX.NS",
+        "PRSMJOHNSN.NS", "RBA.NS", "VMM.NS", "LLOYDSENT.NS", "SAIL.NS", "J&KBANK.NS",
+        "IDBI.NS", "TEXRAIL.NS", "MOTHERSON.NS", "EDELWEISS.NS", "ZEEL.NS",
+        "GMRAIRPORT.NS", "HEMIPROP.NS"
     ]
 
     all_results = []
@@ -290,9 +377,8 @@ if __name__ == "__main__":
                 continue
 
             # 2. Prepare HTF (Higher Timeframe) indicators and merge
-            ema_close_1h = pd.Series(data_1h['Close'].values.flatten(), index=data_1h.index)
-            data_1h['ema_50_1h'] = ta.trend.EMAIndicator(ema_close_1h, window=50).ema_indicator()
-            htf_data = data_1h[['ema_50_1h', 'Close']].rename(columns={'Close': 'close_1h'})
+            data_1h['ema_50_1h'] = ta.trend.EMAIndicator(data_1h['close'].squeeze(), window=50).ema_indicator()
+            htf_data = data_1h[['ema_50_1h', 'close']].rename(columns={'close': 'close_1h'})
 
             # Forward-fill the 1-hour data onto the 5-minute timeline
             merged_data = pd.merge_asof(data_5m.sort_index(), htf_data.sort_index(), left_index=True, right_index=True, direction='backward')
