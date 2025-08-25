@@ -1,9 +1,9 @@
 # In a Google Colab notebook, create a new cell and run this command first:
-# !pip install dhanhq==1.1.2 pandas-ta==0.3.14b
+# !pip install dhanhq==2.0.2 pandas-ta==0.3.14b setuptools numpy==1.26.4
 
 import pandas as pd
 import pandas_ta as ta
-from dhanhq import dhanhq
+from dhanhq import dhanhq, DhanContext # Updated import
 from datetime import datetime, timedelta
 import time
 from typing import Dict, List, Tuple, Optional
@@ -18,8 +18,8 @@ CLIENT_ID = "YOUR_CLIENT_ID"
 ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
 
 # --- Backtesting Parameters ---
-START_DATE = "2024-03-01"  # YYYY-MM-DD
-END_DATE = "2024-03-22"    # YYYY-MM-DD
+START_DATE = "2025-08-01"  # YYYY-MM-DD
+END_DATE = "2025-08-22"    # YYYY-MM-DD
 TIME_FRAME = "15"          # Time interval in minutes
 
 # --- Ticker Configuration ---
@@ -27,10 +27,10 @@ TIME_FRAME = "15"          # Time interval in minutes
 # You can find the security_id from the Dhan API or by using their symbol master list.
 # The format is { "TICKER_NAME_FOR_LOGGING": "SECURITY_ID" }
 TICKERS = {
-    "CANBK": "3518",
+    "CANBK": "10794",
     "IRFC": "10022",
     "PNB": "25",
-    "SJVN": "30146"
+    "SJVN": "18883"
 }
 
 # --- Strategy & Capital Parameters ---
@@ -50,8 +50,6 @@ TAKE_PROFIT_RR = 1.5      # Take Profit as a multiple of Risk (Risk/Reward Ratio
 def fetch_historical_data(dhan: dhanhq, security_id: str, from_date: str, to_date: str, interval: str) -> Optional[pd.DataFrame]:
     """Fetches historical OHLCV data for a given security."""
     try:
-        # The official dhanhq library uses a different function for intraday data.
-        # The format for dates is YYYY-MM-DD.
         data = dhan.intraday_minute_data(
             security_id=security_id,
             exchange_segment='NSE_EQ',
@@ -173,7 +171,9 @@ def run_backtest():
         return
 
     print("--- Starting Backtest ---")
-    dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
+    # Using the recommended DhanContext for initialization
+    dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
+    dhan = dhanhq(dhan_context)
 
     # 1. Fetch and prepare data for all tickers
     print("Fetching and preparing data...")
