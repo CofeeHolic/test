@@ -60,9 +60,14 @@ def fetch_historical_data(dhan: dhanhq, security_id: str, from_date: str, to_dat
             to_date=to_date
         )
 
-        # The above function gets 1-minute data. We need to resample it to the desired timeframe.
-        if data['status'] == 'success' and data.get('data'):
+        if data.get('status') == 'success' and data.get('data'):
             df = pd.DataFrame(data['data'])
+
+            # Add a check to ensure the response is not malformed
+            if df.empty or 'start_date' not in df.columns:
+                print(f"Warning: Malformed or empty data in successful API response for security_id {security_id}.")
+                return None
+
             df['datetime'] = pd.to_datetime(df['start_date'])
             df.set_index('datetime', inplace=True)
 
@@ -82,10 +87,11 @@ def fetch_historical_data(dhan: dhanhq, security_id: str, from_date: str, to_dat
 
             return df.sort_index()
         else:
-            print(f"Warning: No data fetched for security_id {security_id}. Response: {data.get('remarks')}")
+            error_msg = data.get('error_message', str(data))
+            print(f"Warning: API call failed for security_id {security_id}. Reason: {error_msg}")
             return None
     except Exception as e:
-        print(f"Error fetching data for security_id {security_id}: {e}")
+        print(f"Error processing data for security_id {security_id}: {e}")
         return None
 
 def calculate_indicators(df: pd.DataFrame):
