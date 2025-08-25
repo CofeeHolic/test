@@ -107,29 +107,41 @@ def log_trade(stock, action, entry_price=None, exit_price=None, pnl=None, quanti
 
 def get_historical_data(security_id, interval, count):
     try:
-        # Fetch data for the last few days to ensure we have enough candles for indicators.
-        to_date = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        # Fetching 4 days of data should be enough to get 100 5-min candles even with holidays.
-        from_date = (datetime.datetime.now(IST) - timedelta(days=4)).strftime("%Y-%m-%d")
+        to_date = datetime.datetime.now(IST)
+        # Fetch up to 90 days, but we only need a few to get enough candles.
+        from_date = to_date - timedelta(days=4)
 
-        data = dhan.historical_data(
+        # The intraday endpoint requires the 'YYYY-MM-DD HH:MM:SS' format.
+        to_date_str = to_date.strftime('%Y-%m-%d %H:%M:%S')
+        from_date_str = from_date.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Final attempt with an educated guess based on docs and error messages.
+        response_data = dhan.intraday_historical_data(
             security_id=security_id,
             exchange_segment="NSE_EQ",
             instrument_type="EQUITY",
             interval=interval,
-            from_date=from_date,
-            to_date=to_date
+            from_date=from_date_str,
+            to_date=to_date_str
         )
 
-        if data and data.get('status') == 'success' and 'data' in data and 'candles' in data['data']:
-            df = pd.DataFrame(data['data']['candles'], columns=["date", "open", "high", "low", "close", "volume"])
-            df['date'] = pd.to_datetime(df['date'])
-            df.set_index("date", inplace=True)
+        # The intraday API returns a dictionary of lists directly, not nested under 'data' or 'candles'.
+        if response_data and isinstance(response_data, dict) and 'open' in response_data:
+            df = pd.DataFrame({
+                # Timestamp is in epoch, convert to datetime and then to IST.
+                'date': pd.to_datetime(response_data['timestamp'], unit='s', utc=True).tz_convert(IST),
+                'open': response_data['open'],
+                'high': response_data['high'],
+                'low': response_data['low'],
+                'close': response_data['close'],
+                'volume': response_data['volume']
+            })
+            df.set_index('date', inplace=True)
             df = df.astype(float)
-            df.sort_index(inplace=True)  # Ensure data is chronological
+            df.sort_index(inplace=True)
             return df
         else:
-            logging.warning(f"No data for {security_id}: {data.get('remarks', 'Unknown error')}")
+            logging.warning(f"No data or unexpected format for {security_id}: {response_data}")
             return None
     except Exception as e:
         logging.error(f"Error fetching historical data for {security_id}: {e}", exc_info=True)
