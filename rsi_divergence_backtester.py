@@ -50,24 +50,36 @@ TAKE_PROFIT_RR = 1.5      # Take Profit as a multiple of Risk (Risk/Reward Ratio
 def fetch_historical_data(dhan: dhanhq, security_id: str, from_date: str, to_date: str, interval: str) -> Optional[pd.DataFrame]:
     """Fetches historical OHLCV data for a given security."""
     try:
-        # The dhanhq library expects dates in DD-MM-YYYY format for this call
-        formatted_from = datetime.strptime(from_date, '%Y-%m-%d').strftime('%d-%m-%Y')
-        formatted_to = datetime.strptime(to_date, '%Y-%m-%d').strftime('%d-%m-%Y')
-
-        data = dhan.historical_intraday_data(
+        # The official dhanhq library uses a different function for intraday data.
+        # The format for dates is YYYY-MM-DD.
+        data = dhan.intraday_minute_data(
             security_id=security_id,
             exchange_segment='NSE_EQ',
             instrument_type='EQUITY',
-            from_date=formatted_from,
-            to_date=formatted_to
+            from_date=from_date,
+            to_date=to_date
         )
+
+        # The above function gets 1-minute data. We need to resample it to the desired timeframe.
         if data['status'] == 'success' and data.get('data'):
             df = pd.DataFrame(data['data'])
             df['datetime'] = pd.to_datetime(df['start_date'])
             df.set_index('datetime', inplace=True)
-            df = df[['open', 'high', 'low', 'close', 'volume']]
-            # The API returns data for the whole day, so we might need to filter by time if needed
-            # For this backtest, we assume the full day's 15min data is what we want.
+
+            # Resample 1-minute data to the desired timeframe
+            resample_period = f'{interval}T'
+
+            resampling_logic = {
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }
+
+            df = df[['open', 'high', 'low', 'close', 'volume']].resample(resample_period).apply(resampling_logic)
+            df.dropna(inplace=True) # Drop rows with no data in the interval
+
             return df.sort_index()
         else:
             print(f"Warning: No data fetched for security_id {security_id}. Response: {data.get('remarks')}")
