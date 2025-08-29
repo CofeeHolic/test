@@ -1,0 +1,3 @@
+dhanhq
+pandas
+pandas-ta
