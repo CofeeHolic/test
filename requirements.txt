@@ -1,0 +1,7 @@
+dhanhq
+pandas
+pandas-ta
+python-telegram-bot
+schedule
+requests
+pytz
