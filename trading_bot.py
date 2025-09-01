@@ -19,7 +19,22 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 # Bot & Strategy Parameters
-TICKERS = ["CANBK.NS", "IRFC.NS", "PNB.NS", "SJVN.NS", "GMRINFRA.NS"]
+TICKERS = {
+    "NHPC": "11634",
+    "ABFRL": "16669",
+    "GMRINFRA": "14732",
+    "IDBI": "10903",
+    "MOTHERSON": "22",
+    "SJVN": "18883",
+    "PNB": "10666",
+    "CANBK": "10794",
+    "SAIL": "11723",
+    "IRFC": "2029",
+    "ASHOKLEY": "10440",
+    "UNIONBANK": "10926",
+    "IOC": "11783",
+    "IREDA": "27123"
+}
 TIME_FRAME = '15'
 RISK_PER_TRADE_PERCENT = 0.02
 
@@ -106,45 +121,13 @@ def is_market_open():
 
     return market_open_time <= now.time() <= market_close_time
 
-# --- DYNAMIC DATA ---
-SECURITY_ID_MAPPING = {}
-
-def build_security_id_mapping():
-    """Fetches all scrips from Dhan and builds a mapping from symbol to security_id."""
-    global SECURITY_ID_MAPPING
-    try:
-        logger.info("Building security ID mapping...")
-        all_scrips = dhan_data.get_all_scrip_list()
-        if isinstance(all_scrips, list):
-             df = pd.DataFrame(all_scrips)
-        else:
-             # Assuming it might be a dict with a 'data' key
-             df = pd.DataFrame(all_scrips.get('data', []))
-
-        if df.empty:
-            logger.error("Failed to fetch scrip list or list is empty.")
-            return
-
-        # Filter for equity segment on NSE
-        df_nse_eq = df[(df['SEM_EXM_EXCH_ID'] == 'NSE') & (df['SEM_INSTRUMENT'] == 'EQUITY')]
-        SECURITY_ID_MAPPING = pd.Series(df_nse_eq.SEM_SMST_SECURITY_ID.values, index=df_nse_eq.SEM_TRADING_SYMBOL).to_dict()
-        logger.info(f"Security ID mapping built. Found {len(SECURITY_ID_MAPPING)} NSE Equity symbols.")
-        if not all(ticker.split('.')[0] in SECURITY_ID_MAPPING for ticker in TICKERS):
-             logger.warning("Some tickers not found in the security map. Data fetching might fail for them.")
-
-    except Exception as e:
-        logger.critical(f"CRITICAL: Failed to build security ID mapping: {e}")
-        send_telegram_message(f"CRITICAL: Failed to build security ID mapping: {e}")
-        exit()
-
 # --- STRATEGY IMPLEMENTATION ---
 def fetch_and_resample_data(ticker):
     """Fetches 1-minute intraday data and resamples it."""
-    symbol = ticker.split('.')[0]
-    security_id = SECURITY_ID_MAPPING.get(symbol)
+    security_id = TICKERS.get(ticker)
 
     if not security_id:
-        logger.error(f"Security ID not found for {symbol}. Skipping.")
+        logger.error(f"Security ID not found for {ticker}. Skipping.")
         return None
 
     try:
@@ -318,8 +301,10 @@ def execute_bracket_order(ticker, signal, candle):
         logger.error(f"[{ticker}] Could not calculate position details. Aborting trade.")
         return
 
-    symbol = ticker.split('.')[0]
-    security_id = SECURITY_ID_MAPPING.get(symbol)
+    security_id = TICKERS.get(ticker)
+    if not security_id:
+        logger.error(f"[{ticker}] Security ID not found in static map. Aborting trade.")
+        return
 
     try:
         order_response = dhan_trade.place_order(
@@ -447,8 +432,6 @@ def main():
     """Main function to run the trading bot."""
     logger.info("Starting trading bot...")
     send_telegram_message("🤖 **Trading Bot Started** 🤖\nInitializing...")
-
-    build_security_id_mapping()
 
     send_telegram_message("✅ Bot is now running and monitoring tickers.")
 
